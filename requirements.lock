@@ -1,0 +1,7 @@
+# Placeholder lock generated during recovery.
+# Pin exact versions after first controlled install.
+websockets>=15.0
+sounddevice>=0.5.0
+numpy>=2.0.0
+pynput>=1.7.0
+pytest>=8.0
