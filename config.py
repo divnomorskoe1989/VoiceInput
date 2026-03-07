@@ -63,7 +63,7 @@ class AppConfig:
     deepgram_model: str = "nova-2"
     deepgram_language: str = "ru"
     interim_results: bool = True
-    interim_insert_enabled: bool = True
+    interim_insert_enabled: bool = False
     smart_format: bool = True
     log_level: str = "INFO"
     log_max_file_mb: int = 100

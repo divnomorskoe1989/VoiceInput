@@ -50,6 +50,7 @@ class VoiceInputApp:
         self._first_insert_latency_ms: float | None = None
         self._interim_observed = False
         self._last_output_char = ""
+        self._last_inserted_text = ""
         self._collector_thread: threading.Thread | None = None
         self._collector_error: BaseException | None = None
 
@@ -112,6 +113,7 @@ class VoiceInputApp:
             self._first_insert_latency_ms = None
             self._interim_observed = False
             self._last_output_char = ""
+            self._last_inserted_text = ""
             self._collector_error = None
             self._collector_thread = threading.Thread(target=self._collect_transcripts_worker, daemon=True)
             self._collector_thread.start()
@@ -152,6 +154,9 @@ class VoiceInputApp:
                     normalized_text = " " + normalized_text
         if not normalized_text:
             return
+        if self._last_output_char and normalized_text == self._last_inserted_text:
+            self._step("insert_skipped_duplicate", level="debug", text_len=len(normalized_text))
+            return
         result = self.text_inserter.insert_text(
             normalized_text,
             window_title=self._window_title,
@@ -171,6 +176,8 @@ class VoiceInputApp:
             self._inserted_chars += len(normalized_text)
             self._last_strategy = result.strategy
             self._last_output_char = normalized_text[-1]
+            self._last_inserted_text = normalized_text
+            self._logger.debug("INSERTED_TEXT | kind=%s | text=%r", transcript_kind, normalized_text)
             if self._first_insert_latency_ms is None:
                 self._first_insert_latency_ms = max(0.0, (time.monotonic() - self._session_started_at) * 1000)
                 self._step("first_insert_completed", latency_ms=f"{self._first_insert_latency_ms:.1f}")
@@ -187,10 +194,10 @@ class VoiceInputApp:
         # Find word boundaries in delta — only commit up to the second-to-last
         # word boundary to keep a buffer against Deepgram hypothesis rewrites.
         words = delta.split()
-        if len(words) < 3:
+        if len(words) < 5:
             return ""
-        # Commit all but the last 2 words
-        stable = " ".join(words[:-2]) + " "
+        # Commit all but the last 4 words to avoid Deepgram hypothesis rewrites
+        stable = " ".join(words[:-4]) + " "
         return stable
 
     def _trim_final_with_interim(self, final_text: str) -> tuple[str, int]:
@@ -202,9 +209,9 @@ class VoiceInputApp:
         if final_text.startswith(committed):
             return final_text[len(committed) :], len(committed)
 
-        # Normalize for fuzzy comparison (strip spaces, lowercase)
+        # Normalize for fuzzy comparison (strip spaces, lowercase, remove punctuation)
         def _norm(s: str) -> str:
-            return " ".join(s.lower().split())
+            return " ".join(s.lower().replace(",", "").replace(".", "").replace("!", "").replace("?", "").split())
 
         norm_committed = _norm(committed)
         norm_final = _norm(final_text)
