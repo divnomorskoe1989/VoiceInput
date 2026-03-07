@@ -151,7 +151,17 @@ class DeepgramSTTClient(MockSTTClient):
         if not transcript:
             return
 
-        is_final = bool(payload.get("is_final") or payload.get("speech_final"))
+        is_final = bool(payload.get("is_final"))
+        speech_final = bool(payload.get("speech_final"))
+
+        if speech_final and not is_final:
+            self._logger.debug(
+                "DEEPGRAM | event=speech_final_only_skipped | text_len=%s | text=%r",
+                len(transcript),
+                transcript[:80],
+            )
+            return
+
         yield TranscriptEvent(text=transcript, is_final=is_final, source="deepgram")
 
     def stream_transcripts(self, audio_chunks: Iterable[bytes]) -> Iterator[TranscriptEvent]:

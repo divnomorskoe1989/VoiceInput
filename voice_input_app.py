@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import threading
 import time
+from collections import deque
 
 from audio_recorder import AudioRecorder
 from config import AppConfig, detect_window_hint
@@ -13,6 +15,12 @@ from stt_client import STTClient
 from text_inserter import TextInserter
 from text_normalizer import normalize_transcript_text
 from tray_manager import TrayManager
+
+_DEDUPE_STRIP_RE = re.compile(r"[^\w\s]", re.UNICODE)
+
+
+def _normalize_for_dedupe(text: str) -> str:
+    return " ".join(_DEDUPE_STRIP_RE.sub("", text).lower().split())
 
 
 class VoiceInputApp:
@@ -46,11 +54,13 @@ class VoiceInputApp:
         self._interim_inserted_text = ""
         self._last_final_hash = ""
         self._last_final_ts = 0.0
+        self._recent_final_hashes: deque[str] = deque(maxlen=8)
         self._first_transcript_latency_ms: float | None = None
         self._first_insert_latency_ms: float | None = None
         self._interim_observed = False
         self._last_output_char = ""
         self._last_inserted_text = ""
+        self._recent_inserted_normalized: deque[str] = deque(maxlen=8)
         self._collector_thread: threading.Thread | None = None
         self._collector_error: BaseException | None = None
 
@@ -109,11 +119,13 @@ class VoiceInputApp:
             self._interim_inserted_text = ""
             self._last_final_hash = ""
             self._last_final_ts = 0.0
+            self._recent_final_hashes.clear()
             self._first_transcript_latency_ms = None
             self._first_insert_latency_ms = None
             self._interim_observed = False
             self._last_output_char = ""
             self._last_inserted_text = ""
+            self._recent_inserted_normalized.clear()
             self._collector_error = None
             self._collector_thread = threading.Thread(target=self._collect_transcripts_worker, daemon=True)
             self._collector_thread.start()
@@ -154,9 +166,19 @@ class VoiceInputApp:
                     normalized_text = " " + normalized_text
         if not normalized_text:
             return
-        if self._last_output_char and normalized_text == self._last_inserted_text:
-            self._step("insert_skipped_duplicate", level="debug", text_len=len(normalized_text))
+
+        # Fuzzy dedup: check against ring buffer of recent inserts (normalized)
+        norm_for_dedup = _normalize_for_dedupe(normalized_text)
+        if norm_for_dedup and norm_for_dedup in self._recent_inserted_normalized:
+            self._step(
+                "insert_skipped_duplicate",
+                level="warning",
+                mechanism="fuzzy_ring_buffer",
+                text_len=len(normalized_text),
+                normalized=repr(norm_for_dedup[:60]),
+            )
             return
+
         result = self.text_inserter.insert_text(
             normalized_text,
             window_title=self._window_title,
@@ -177,6 +199,8 @@ class VoiceInputApp:
             self._last_strategy = result.strategy
             self._last_output_char = normalized_text[-1]
             self._last_inserted_text = normalized_text
+            if norm_for_dedup:
+                self._recent_inserted_normalized.append(norm_for_dedup)
             self._logger.debug("INSERTED_TEXT | kind=%s | text=%r", transcript_kind, normalized_text)
             if self._first_insert_latency_ms is None:
                 self._first_insert_latency_ms = max(0.0, (time.monotonic() - self._session_started_at) * 1000)
@@ -184,19 +208,61 @@ class VoiceInputApp:
 
     def _extract_stable_interim_delta(self, interim_text: str) -> str:
         committed = self._interim_inserted_text
-        if not interim_text or not interim_text.startswith(committed):
+        if not interim_text:
             return ""
 
-        delta = interim_text[len(committed) :]
-        if not delta:
-            return ""
+        # Exact prefix check (fast path)
+        if committed and interim_text.startswith(committed):
+            delta = interim_text[len(committed):]
+            if not delta:
+                return ""
+            words = delta.split()
+            if len(words) < 5:
+                return ""
+            stable = " ".join(words[:-4]) + " "
+            return stable
 
-        # Find word boundaries in delta — only commit up to the second-to-last
-        # word boundary to keep a buffer against Deepgram hypothesis rewrites.
-        words = delta.split()
+        # Fuzzy prefix check: use normalized words when Deepgram adds punctuation
+        if committed:
+            norm_committed = _normalize_for_dedupe(committed)
+            norm_interim = _normalize_for_dedupe(interim_text)
+            if not norm_interim.startswith(norm_committed):
+                return ""
+            # Committed words match; extract NEW words from interim
+            committed_word_count = len(norm_committed.split()) if norm_committed else 0
+            interim_words = norm_interim.split()
+            new_words = interim_words[committed_word_count:]
+            if len(new_words) < 5:
+                return ""
+            # Use original interim text to get properly formatted words
+            # Skip committed_word_count words in original interim_text
+            fi = 0
+            words_skipped = 0
+            in_word = False
+            while fi < len(interim_text) and words_skipped < committed_word_count:
+                is_wc = interim_text[fi].isalnum() or interim_text[fi] == '_'
+                if is_wc and not in_word:
+                    in_word = True
+                elif not is_wc and in_word:
+                    words_skipped += 1
+                    in_word = False
+                fi += 1
+            if in_word:
+                words_skipped += 1
+            # Skip trailing non-word chars
+            while fi < len(interim_text) and not (interim_text[fi].isalnum() or interim_text[fi] == '_'):
+                fi += 1
+            remaining = interim_text[fi:]
+            words = remaining.split()
+            if len(words) < 5:
+                return ""
+            stable = " ".join(words[:-4]) + " "
+            return stable
+
+        # No committed text yet — extract from full interim
+        words = interim_text.split()
         if len(words) < 5:
             return ""
-        # Commit all but the last 4 words to avoid Deepgram hypothesis rewrites
         stable = " ".join(words[:-4]) + " "
         return stable
 
@@ -205,53 +271,73 @@ class VoiceInputApp:
         if not committed:
             return final_text, 0
 
-        # Exact prefix match
+        # Exact prefix match (fast path)
         if final_text.startswith(committed):
-            return final_text[len(committed) :], len(committed)
+            return final_text[len(committed):], len(committed)
 
-        # Normalize for fuzzy comparison (strip spaces, lowercase, remove punctuation)
-        def _norm(s: str) -> str:
-            return " ".join(s.lower().replace(",", "").replace(".", "").replace("!", "").replace("?", "").split())
+        norm_committed = _normalize_for_dedupe(committed)
+        norm_final = _normalize_for_dedupe(final_text)
 
-        norm_committed = _norm(committed)
-        norm_final = _norm(final_text)
+        if not norm_committed:
+            return final_text, 0
 
-        # Check if normalized final starts with normalized committed
+        # Full overlap: committed covers all (or more than) final content
+        if norm_final == norm_committed or norm_committed.startswith(norm_final):
+            self._step(
+                "trim_final_fully_covered",
+                committed_len=len(committed),
+                final_len=len(final_text),
+            )
+            return "", len(final_text)
+
+        # Partial overlap: final starts with committed (word-based alignment)
         if norm_final.startswith(norm_committed):
-            # Find where in original final_text the committed portion ends
-            # by matching character by character ignoring whitespace differences
-            fi = 0
-            ci = 0
-            while ci < len(committed) and fi < len(final_text):
-                if committed[ci].lower() == final_text[fi].lower():
-                    ci += 1
-                    fi += 1
-                elif final_text[fi].isspace():
-                    fi += 1
-                elif committed[ci].isspace():
-                    ci += 1
-                else:
-                    break
-            if ci >= len(committed):
-                return final_text[fi:], fi
+            committed_word_count = len(norm_committed.split())
+            return self._skip_n_words_in_original(final_text, committed_word_count)
 
-        # Suffix-prefix overlap match (threshold 3) — scan from longest plausible overlap
-        max_overlap = min(len(norm_committed), len(norm_final))
-        best_overlap = 0
-        for overlap in range(max_overlap, 2, -1):
-            if norm_committed[-overlap:] == norm_final[:overlap]:
-                best_overlap = overlap
+        # Suffix-prefix overlap: committed tail matches final head (word-based)
+        committed_words = norm_committed.split()
+        final_words = norm_final.split()
+        best_word_overlap = 0
+        max_check = min(len(committed_words), len(final_words))
+        for n in range(max_check, 0, -1):
+            if committed_words[-n:] == final_words[:n]:
+                best_word_overlap = n
                 break
-        if best_overlap >= 3:
-            # Map back to original final_text position
-            matched = 0
-            fi = 0
-            while matched < best_overlap and fi < len(final_text):
-                if not final_text[fi].isspace():
-                    matched += 1
-                fi += 1
-            return final_text[fi:], fi
+        if best_word_overlap >= 1:
+            return self._skip_n_words_in_original(final_text, best_word_overlap)
+
+        self._step(
+            "trim_final_no_overlap",
+            level="warning",
+            committed=repr(committed[:60]),
+            final=repr(final_text[:60]),
+            norm_committed=repr(norm_committed[:60]),
+            norm_final=repr(norm_final[:60]),
+        )
         return final_text, 0
+
+    @staticmethod
+    def _skip_n_words_in_original(text: str, word_count: int) -> tuple[str, int]:
+        """Skip first N words in text (by word boundaries), return remainder and offset."""
+        fi = 0
+        words_skipped = 0
+        in_word = False
+        while fi < len(text) and words_skipped < word_count:
+            is_wc = text[fi].isalnum() or text[fi] == '_'
+            if is_wc and not in_word:
+                in_word = True
+            elif not is_wc and in_word:
+                words_skipped += 1
+                in_word = False
+            fi += 1
+        if in_word:
+            words_skipped += 1
+        while fi < len(text) and not (text[fi].isalnum() or text[fi] == '_'):
+            fi += 1
+        if words_skipped >= word_count:
+            return text[fi:], fi
+        return text, 0
 
     def _handle_transcript(self, event: TranscriptEvent) -> None:
         if not event.text:
@@ -290,9 +376,13 @@ class VoiceInputApp:
             )
             return
 
-        final_hash = hashlib.sha1(event.text.encode("utf-8", errors="ignore")).hexdigest()
+        # --- Final transcript dedup (normalized hash + ring buffer) ---
+        norm_text = _normalize_for_dedupe(event.text)
+        final_hash = hashlib.sha1(norm_text.encode("utf-8", errors="ignore")).hexdigest()
         now = time.monotonic()
         dedupe_window_sec = max(0, self.config.transcript_dedupe_window_ms) / 1000
+
+        # Check against last final (time-windowed)
         if (
             self._last_final_hash == final_hash
             and self._last_final_ts > 0.0
@@ -300,30 +390,45 @@ class VoiceInputApp:
         ):
             self._step(
                 "transcript_final_deduped",
+                mechanism="exact_hash_window",
                 length=len(event.text),
+                normalized=repr(norm_text[:60]),
                 dedupe_window_ms=self.config.transcript_dedupe_window_ms,
+            )
+            return
+
+        # Check against ring buffer of recent finals
+        if final_hash in self._recent_final_hashes:
+            self._step(
+                "transcript_final_deduped",
+                mechanism="ring_buffer",
+                length=len(event.text),
+                normalized=repr(norm_text[:60]),
             )
             return
 
         self._last_final_hash = final_hash
         self._last_final_ts = now
-        self._step("transcript_final", length=len(event.text))
+        self._recent_final_hashes.append(final_hash)
+        self._step("transcript_final", length=len(event.text), normalized_hash=final_hash[:12])
         final_text = event.text
         if self.config.interim_insert_enabled and self._interim_inserted_text:
             final_text, overlap = self._trim_final_with_interim(final_text)
             if overlap > 0:
                 self._step(
                     "transcript_final_trimmed_by_interim",
-                    level="debug",
                     trimmed_len=overlap,
                     remaining_len=len(final_text),
+                    remaining=repr(final_text[:50]),
                 )
             else:
                 self._step(
                     "transcript_final_not_aligned_with_interim",
-                    level="debug",
+                    level="warning",
                     committed_len=len(self._interim_inserted_text),
-                    final_len=len(final_text),
+                    committed=repr(self._interim_inserted_text[:50]),
+                    final_len=len(event.text),
+                    final=repr(event.text[:50]),
                 )
         if final_text:
             self._insert_text_fragment(final_text, transcript_kind="final")
