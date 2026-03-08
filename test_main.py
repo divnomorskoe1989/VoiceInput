@@ -14,8 +14,8 @@ def test_modifier_only_hotkey_detection():
 
 
 def test_modifier_match_for_ctrl_win_hotkey():
-    assert recovered_main._modifiers_match_hotkey({"ctrl_l", "cmd_r"}, "ctrl+win") is True
-    assert recovered_main._modifiers_match_hotkey({"ctrl_l"}, "ctrl+win") is False
+    assert recovered_main._modifiers_match_hotkey({"ctrl", "cmd"}, "ctrl+win") is True
+    assert recovered_main._modifiers_match_hotkey({"ctrl"}, "ctrl+win") is False
 
 
 def test_main_once_deepgram_without_key_returns_config_error(monkeypatch, capsys):

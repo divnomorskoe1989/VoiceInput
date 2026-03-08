@@ -135,15 +135,23 @@ def _hotkey_tokens(hotkey: str) -> list[str]:
 
 def _modifier_aliases() -> dict[str, set[str]]:
     return {
-        "ctrl": {"ctrl", "ctrl_l", "ctrl_r"},
-        "control": {"ctrl", "ctrl_l", "ctrl_r"},
-        "alt": {"alt", "alt_l", "alt_r"},
-        "shift": {"shift", "shift_l", "shift_r"},
-        "win": {"cmd", "cmd_l", "cmd_r"},
-        "windows": {"cmd", "cmd_l", "cmd_r"},
-        "cmd": {"cmd", "cmd_l", "cmd_r"},
-        "super": {"cmd", "cmd_l", "cmd_r"},
+        "ctrl": {"ctrl"},
+        "control": {"ctrl"},
+        "alt": {"alt"},
+        "shift": {"shift"},
+        "win": {"cmd"},
+        "windows": {"cmd"},
+        "cmd": {"cmd"},
+        "super": {"cmd"},
     }
+
+
+def _normalize_modifier_name(name: str) -> str:
+    """Normalize modifier key names: ctrl_l/ctrl_r -> ctrl, cmd_l/cmd_r -> cmd, etc."""
+    for suffix in ("_l", "_r"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
 
 
 def _is_modifier_only_hotkey(hotkey: str) -> bool:
@@ -211,7 +219,7 @@ def run_hotkey_listener(handler: HotkeyHandler, hotkey: str, exit_key: str = "es
 
     def on_press(key) -> None:
         nonlocal modifier_chord_fired
-        key_name = _key_name(key)
+        key_name = _normalize_modifier_name(_key_name(key))
         pressed_names.add(key_name)
 
         if hotkey_runtime is not None:
@@ -224,7 +232,7 @@ def run_hotkey_listener(handler: HotkeyHandler, hotkey: str, exit_key: str = "es
 
     def on_release(key):
         nonlocal modifier_chord_fired
-        key_name = _key_name(key)
+        key_name = _normalize_modifier_name(_key_name(key))
 
         if hotkey_runtime is not None:
             hotkey_runtime.release(listener.canonical(key))
