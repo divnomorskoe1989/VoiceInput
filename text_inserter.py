@@ -135,17 +135,59 @@ class TextInserter:
             if handle:
                 self._kernel32.GlobalFree(handle)
 
+    def _send_ctrl_v_sendinput(self) -> bool:
+        """Send Ctrl+V using Win32 SendInput — reliable even with pynput Listener active."""
+        if self._user32 is None:
+            return False
+        try:
+            VK_CONTROL = 0x11
+            VK_V = 0x56
+            KEYEVENTF_KEYUP = 0x0002
+            INPUT_KEYBOARD = 1
+
+            class KEYBDINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("wVk", ctypes.wintypes.WORD),
+                    ("wScan", ctypes.wintypes.WORD),
+                    ("dwFlags", ctypes.wintypes.DWORD),
+                    ("time", ctypes.wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+                ]
+
+            class INPUT(ctypes.Structure):
+                class _INPUT_UNION(ctypes.Union):
+                    _fields_ = [("ki", KEYBDINPUT)]
+                _fields_ = [
+                    ("type", ctypes.wintypes.DWORD),
+                    ("union", _INPUT_UNION),
+                ]
+
+            def make_key_input(vk, flags=0):
+                inp = INPUT()
+                inp.type = INPUT_KEYBOARD
+                inp.union.ki.wVk = vk
+                inp.union.ki.dwFlags = flags
+                return inp
+
+            inputs = (INPUT * 4)(
+                make_key_input(VK_CONTROL),
+                make_key_input(VK_V),
+                make_key_input(VK_V, KEYEVENTF_KEYUP),
+                make_key_input(VK_CONTROL, KEYEVENTF_KEYUP),
+            )
+            sent = ctypes.windll.user32.SendInput(4, ctypes.byref(inputs), ctypes.sizeof(INPUT))
+            return sent == 4
+        except Exception:
+            self._logger.exception("SendInput Ctrl+V failed.")
+            return False
+
     def _send_shortcut(self, strategy: str) -> bool:
+        if os.name == "nt" and strategy in {"ctrl_v", "send_input_ctrl_v", "wm_paste"}:
+            return self._send_ctrl_v_sendinput()
         if self._keyboard is None:
             return False
         try:
             from pynput.keyboard import Key
-            if strategy in {"ctrl_v", "send_input_ctrl_v", "wm_paste"}:
-                self._keyboard.press(Key.ctrl)
-                self._keyboard.press("v")
-                self._keyboard.release("v")
-                self._keyboard.release(Key.ctrl)
-                return True
             if strategy == "shift_insert":
                 self._keyboard.press(Key.shift)
                 self._keyboard.press(Key.insert)
