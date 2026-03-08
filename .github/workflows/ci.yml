@@ -1,5 +1,8 @@
 name: ci
 on: [push, pull_request]
+defaults:
+  run:
+    working-directory: Voiceinput_recovered
 jobs:
   test:
     runs-on: windows-latest
