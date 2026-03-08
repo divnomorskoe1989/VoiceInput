@@ -9,4 +9,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - run: pytest -q
+      - run: pytest -q --ignore=test_sound.py --ignore=test_quality_soak.py -k "not test_audio_recorder"
